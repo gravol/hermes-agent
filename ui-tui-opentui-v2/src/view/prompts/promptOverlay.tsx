@@ -11,6 +11,7 @@
  */
 import { Match, Switch } from 'solid-js'
 
+import { deferClose } from '../../logic/defer.ts'
 import type { SessionStore } from '../../logic/store.ts'
 import { ApprovalPrompt } from './approvalPrompt.tsx'
 import { ClarifyPrompt } from './clarifyPrompt.tsx'
@@ -28,7 +29,7 @@ export function PromptOverlay(props: PromptOverlayProps) {
   // Defer the prompt-clear (which remounts + refocuses the composer) past the
   // CURRENT keystroke, so the key that answered the prompt (Enter/y/select) can't
   // leak into the freshly-focused composer (e.g. `/clear`→y left "y" in the input).
-  const clearSoon = () => setTimeout(() => props.store.clearPrompt(), 0)
+  const clearSoon = () => deferClose(() => props.store.clearPrompt())
   const respond = (method: string, params: Record<string, unknown>) => {
     props.onRespond(method, params)
     clearSoon()

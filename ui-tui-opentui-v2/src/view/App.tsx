@@ -15,6 +15,7 @@
  */
 import { Match, Switch } from 'solid-js'
 
+import { deferClose } from '../logic/defer.ts'
 import type { PromptHistory } from '../logic/history.ts'
 import type { PasteStore } from '../logic/pastes.ts'
 import type { SessionStore } from '../logic/store.ts'
@@ -56,11 +57,11 @@ export function App(props: AppProps) {
   const switcher = () => props.store.state.switcher
   const picker = () => props.store.state.picker
   // Defer the close so the key that closed an overlay (Esc/q/Enter) can't land in
-  // the freshly-remounted composer.
-  const closePager = () => setTimeout(() => props.store.closePager(), 0)
-  const closeDashboard = () => setTimeout(() => props.store.closeDashboard(), 0)
-  const closeSwitcher = () => setTimeout(() => props.store.closeSwitcher(), 0)
-  const closePicker = () => setTimeout(() => props.store.closePicker(), 0)
+  // the freshly-remounted composer (see deferClose).
+  const closePager = () => deferClose(() => props.store.closePager())
+  const closeDashboard = () => deferClose(() => props.store.closeDashboard())
+  const closeSwitcher = () => deferClose(() => props.store.closeSwitcher())
+  const closePicker = () => deferClose(() => props.store.closePicker())
   const resume = (id: string) => {
     ;(props.onResume ?? NOOP_RESUME)(id)
     closeSwitcher()
