@@ -114,19 +114,52 @@ jobs:
         with:
           name: hermes-installer-${{ runner.os }}-${{ hashFiles('package-lock.json', 'apps/bootstrap-installer/**', '!apps/bootstrap-installer/src-tauri/target/**') }}
 
-      - name: Install AutoHotkey v2
-        shell: pwsh
-        run: |
-          winget install -e --id AutoHotkey.AutoHotkey --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
-          $ahkDir = "$env:ProgramW6432\AutoHotkey\v2"
-          Add-Content -Path $env:GITHUB_PATH -Value $ahkDir
+      - name: Restore cached test tools
+        id: test-tools-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: test-bins
+          key: test-bins-${{ runner.os }}-v1
 
-      - name: Install ffmpeg
+      - name: Install AutoHotkey v2 and ffmpeg
+        if: steps.test-tools-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
+          # Install fresh when the cache missed.
+          winget install -e --id AutoHotkey.AutoHotkey --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
           winget install -e --id Gyan.FFmpeg --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
-          $wingetLinks = "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
-          echo $wingetLinks | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          New-Item -ItemType Directory -Path test-bins\autohotkey, test-bins\ffmpeg -Force | Out-Null
+
+          # AutoHotkey: copy its whole v2 directory so helper exes/dlls come along.
+          $ahkDir = "$env:ProgramW6432\AutoHotkey\v2"
+          if (-not (Test-Path $ahkDir)) {
+            throw "AutoHotkey install directory not found: $ahkDir"
+          }
+          Copy-Item -Path "$ahkDir\*" -Destination test-bins\autohotkey -Recurse -Force
+
+          # ffmpeg: WinGet drops symlinks in its Links dir; resolve the real bin dir and copy everything.
+          $ffmpegLink = "$env:LOCALAPPDATA\Microsoft\WinGet\Links\ffmpeg.exe"
+          if (-not (Test-Path $ffmpegLink)) {
+            throw "ffmpeg symlink not found after winget install: $ffmpegLink"
+          }
+          $ffmpegItem = Get-Item $ffmpegLink
+          $ffmpegReal = if ($ffmpegItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            $ffmpegItem.Target[0]
+          } else {
+            $ffmpegLink
+          }
+          if (-not $ffmpegReal -or -not (Test-Path $ffmpegReal)) {
+            throw "Could not resolve ffmpeg symlink target"
+          }
+          $ffmpegDir = Split-Path $ffmpegReal
+          Copy-Item -Path "$ffmpegDir\*" -Destination test-bins\ffmpeg -Recurse -Force
+
+      - name: Add test-bins to PATH
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_PATH -Value "$PWD\test-bins\autohotkey"
+          Add-Content -Path $env:GITHUB_PATH -Value "$PWD\test-bins\ffmpeg"
 
       # ── Stage the real installer binary as a user download ──────────
       - name: Stage Hermes-Setup.exe in Downloads
@@ -140,19 +173,14 @@ jobs:
           Copy-Item -Path 'Hermes-Setup.exe' -Destination "$downloads\Hermes-Setup.exe" -Force
           Write-Host "Staged installer: $downloads\Hermes-Setup.exe"
 
-      # ── Prepare an isolated HERMES_HOME and pre-clone the repo ──────
-      # This lets install.ps1 use the local checkout as its git origin,
-      # so the whole flow exercises the real installer without reaching GitHub.
-      - name: Pre-clone workspace into isolated HERMES_HOME
+      # ── Prepare an isolated HERMES_HOME and copy checked-out repo ──────
+      # actions/checkout already has the right commit; just mirror it into the
+      # isolated home so the installer doesn't need to reach GitHub.
+      - name: Copy checked-out workspace into isolated HERMES_HOME
         shell: pwsh
         run: |
           $installDir = "$env:HERMES_HOME\hermes-agent"
-          New-Item -ItemType Directory -Path "$installDir\.." -Force | Out-Null
-          git clone --no-hardlinks "${{ github.workspace }}" "$installDir"
-          # Make sure the clone has the pinned commit reachable.
-          Push-Location "$installDir"
-          git fetch origin ${{ github.sha }} 2>$null || git fetch --depth=1 origin ${{ github.sha }}
-          Pop-Location
+          Copy-Item -Path "${{ github.workspace }}" -Destination $installDir -Recurse -Force
           Write-Host "Isolated install dir ready: $installDir"
 
       # ── Screen recording for coordinate discovery ───────────────────
@@ -205,7 +233,7 @@ jobs:
           '@
           $ahk | Out-File -Encoding utf8 "capture-button.ahk"
 
-          $ahkProc = Start-Process AutoHotkey64
+          $ahkProc = Start-Process -FilePath ".\test-bins\autohotkey\AutoHotkey64.exe" `
             -ArgumentList '"capture-button.ahk"' -PassThru -NoNewWindow `
             -RedirectStandardOutput ahk-stdout.log -RedirectStandardError ahk-stderr.log
 
