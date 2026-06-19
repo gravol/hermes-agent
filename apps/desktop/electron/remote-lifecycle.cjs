@@ -28,6 +28,11 @@
 const crypto = require('node:crypto')
 
 const LOCKFILE_SCHEMA_VERSION = 1
+// Bumped when the desktop<->dashboard reuse contract changes in a way that
+// makes an old running dashboard unsafe to reattach to (token handling, the
+// readiness/spawn args, the served-token reconciliation). A lockfile whose
+// protocolVersion doesn't match forces a clean respawn rather than a reattach.
+const PROTOCOL_VERSION = 1
 const READY_RE = /^HERMES_DASHBOARD_READY port=(\d+)/m
 // Remote log the detached dashboard appends to; also where we scrape readiness.
 const REMOTE_LOG = '~/.hermes/logs/desktop-ssh.log'
@@ -132,6 +137,18 @@ async function probeRemotePlatform(ssh) {
     throw err
   }
   return { os: osName, arch }
+}
+
+// The HERMES_HOME the remote dashboard will use (explicit env wins, else
+// ~/.hermes). Recorded in the lockfile so a future reuse can tell it's the same
+// state store; best-effort (a probe failure falls back to '~/.hermes').
+async function probeRemoteHermesHome(ssh) {
+  try {
+    const out = (await ssh.exec('echo "${HERMES_HOME:-$HOME/.hermes}"')).trim().split('\n').pop()
+    return out || '~/.hermes'
+  } catch {
+    return '~/.hermes'
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +380,11 @@ async function connect(deps) {
   if (lock && lock.pid && lock.port) {
     const pidAlive = await remotePidAlive(ssh, lock.pid)
     const fpMatch = Boolean(reuseToken) && lock.tokenFingerprint === fingerprintToken(reuseToken)
-    if (pidAlive && fpMatch) {
+    // A lockfile written by an incompatible protocol (older/newer reuse
+    // contract) is not safe to reattach to — treat it like a stale lock and
+    // respawn. Absent protocolVersion (pre-versioning) also fails closed.
+    const protoMatch = lock.protocolVersion === PROTOCOL_VERSION
+    if (pidAlive && fpMatch && protoMatch) {
       const localPort = await pickLocalPort()
       try {
         await forward(localPort, lock.port)
@@ -400,7 +421,7 @@ async function connect(deps) {
         await cancelForwardSafe(deps, localPort, lock.port)
       }
     } else {
-      log(`lockfile present but not reusable (pidAlive=${pidAlive}, fpMatch=${fpMatch})`)
+      log(`lockfile present but not reusable (pidAlive=${pidAlive}, fpMatch=${fpMatch}, protoMatch=${protoMatch})`)
     }
     // Any failed condition → cleanup (kill only if provably ours) and respawn.
     await cleanupStale(ssh, clientId, lock.pid)
@@ -431,12 +452,15 @@ async function connect(deps) {
   })
   const tokenFingerprint = fingerprintToken(token)
 
+  const hermesHome = await probeRemoteHermesHome(ssh)
   await writeLockfile(ssh, clientId, {
     pid,
     port: remotePort,
     profile,
     hermesPath,
+    hermesHome,
     tokenFingerprint,
+    protocolVersion: PROTOCOL_VERSION,
     startedAt: new Date().toISOString()
   })
 
@@ -446,6 +470,7 @@ async function connect(deps) {
 module.exports = {
   DEFAULT_READY_TIMEOUT_MS,
   LOCKFILE_SCHEMA_VERSION,
+  PROTOCOL_VERSION,
   READY_RE,
   REMOTE_LOCK_DIR,
   REMOTE_LOG,
@@ -460,6 +485,7 @@ module.exports = {
   mintToken,
   pidIsOurDashboard,
   probeRemotePlatform,
+  probeRemoteHermesHome,
   readLockfile,
   remotePidAlive,
   removeLockfile,

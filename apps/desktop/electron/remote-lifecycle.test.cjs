@@ -14,6 +14,7 @@ const assert = require('node:assert/strict')
 
 const {
   LOCKFILE_SCHEMA_VERSION,
+  PROTOCOL_VERSION,
   buildSpawnCommand,
   cleanupStale,
   clientLockId,
@@ -261,6 +262,7 @@ test('connect() reuses a healthy dashboard when fingerprint + probe pass', async
   const reuseToken = 'stored-token'
   const lock = {
     schemaVersion: LOCKFILE_SCHEMA_VERSION,
+    protocolVersion: PROTOCOL_VERSION,
     pid: 333,
     port: 40000,
     tokenFingerprint: fingerprintToken(reuseToken)
@@ -279,6 +281,50 @@ test('connect() reuses a healthy dashboard when fingerprint + probe pass', async
   assert.equal(result.remotePort, 40000)
   // never spawned
   assert.ok(!ssh.calls.some(c => /setsid/.test(c)), 'reuse path must not spawn a new dashboard')
+})
+
+test('connect() respawns when the lockfile protocolVersion is incompatible', async () => {
+  const reuseToken = 'stored-token'
+  // alive pid, matching fingerprint, but a protocolVersion we no longer accept
+  const lock = {
+    schemaVersion: LOCKFILE_SCHEMA_VERSION,
+    protocolVersion: PROTOCOL_VERSION + 99,
+    pid: 333,
+    port: 40000,
+    tokenFingerprint: fingerprintToken(reuseToken)
+  }
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/cmdline|ps -o/, ''], // not provably ours → not killed, lockfile dropped
+    [/setsid/, '901\n'],
+    [/kill -0 901/, 'ALIVE'],
+    [/awk/, 'HERMES_DASHBOARD_READY port=44100\n']
+  ])
+  const result = await connect(connectDeps(ssh, { reuseToken, adoptServedToken: async () => 'fresh' }))
+  assert.equal(result.reused, false, 'incompatible protocol must force a fresh spawn, not a reattach')
+  assert.equal(result.pid, 901)
+})
+
+test('connect() fresh spawn writes hermesHome + protocolVersion into the lockfile', async () => {
+  const writes = []
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, ''], // no lockfile
+    [/HERMES_HOME/, '/home/jonny/.hermes\n'], // probeRemoteHermesHome
+    [/printf '%s\\\\n'/, ''],
+    [/setsid/, '700\n'],
+    [/kill -0 700/, 'ALIVE'],
+    [/awk/, 'HERMES_DASHBOARD_READY port=45500\n'],
+    [/printf '%s' '/, c => { writes.push(c); return '' }] // writeLockfile printf
+  ])
+  await connect(connectDeps(ssh, { adoptServedToken: async () => 'fresh' }))
+  const lockWrite = writes.find(c => c.includes('schemaVersion')) || ''
+  assert.match(lockWrite, new RegExp(`"protocolVersion":${PROTOCOL_VERSION}`))
+  assert.match(lockWrite, /"hermesHome":"\/home\/jonny\/\.hermes"/)
 })
 
 test('connect() respawns when the lockfile pid is dead (killed dashboard)', async () => {
@@ -303,6 +349,7 @@ test('connect() respawns when the dashboard is wedged (alive pid, probe fails)',
   const reuseToken = 'stored'
   const lock = {
     schemaVersion: LOCKFILE_SCHEMA_VERSION,
+    protocolVersion: PROTOCOL_VERSION,
     pid: 333,
     port: 40000,
     tokenFingerprint: fingerprintToken(reuseToken)
