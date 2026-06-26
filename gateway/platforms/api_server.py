@@ -3946,18 +3946,11 @@ class APIServerAdapter(BasePlatformAdapter):
             async with aiohttp.ClientSession() as ntfy_session:
                 await ntfy_session.post(
                     f"{ntfy_url.rstrip('/')}/{topic}",
-                    json={
-                        "title": "Hermes Response Ready",
-                        "message": f"Session: {session_id[:16]}…",
-                        "priority": 4,
-                        "tags": ["hermes"],
-                        "actions": [
-                            {
-                                "action": "view",
-                                "label": "Open",
-                                "url": f"hermes-android://session/{session_id}",
-                            }
-                        ],
+                    data=f"Hermes finished session {session_id[:16]}…",
+                    headers={
+                        "Title": "Hermes Response Ready",
+                        "Priority": "4",
+                        "Tags": "hermes",
                     },
                     timeout=aiohttp.ClientTimeout(total=5),
                 )
