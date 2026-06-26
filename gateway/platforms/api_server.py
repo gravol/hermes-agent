@@ -2399,9 +2399,6 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
 
-            # Fire ntfy push notification (fire-and-forget)
-            asyncio.ensure_future(self._notify_ntfy(_eff_sid))
-
             # Finish chunk
             finish_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
@@ -2416,19 +2413,14 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            # Client disconnected mid-stream.  Interrupt the agent so it
-            # stops making new LLM API calls, but DON'T cancel the task —
-            # the agent still needs to finish and persist its result to the
-            # session so _checkPendingOnResume() can find it on reconnect.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
-            # Do NOT cancel agent_task — let it complete so the result
-            # is stored in the session database for fetch-on-resume.
-            logger.info("SSE client disconnected; agent will complete in background for session %s", completion_id)
+            # Client disconnected mid-stream (phone locked, app closed).
+            # Do NOT interrupt or cancel the agent — let it finish and
+            # persist its result to the session DB so fetch-on-resume
+            # (or ntfy push) can deliver it when the client reconnects.
+            logger.info(
+                "SSE client disconnected; agent will complete in background for session %s",
+                completion_id,
+            )
         except Exception as _exc:
             # Agent crashed mid-stream.  Try to emit an error chunk
             # so the client gets a proper response instead of a
@@ -2445,6 +2437,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 await response.write(b"data: [DONE]\n\n")
             except Exception:
                 pass
+
+        # Always fire ntfy push on agent completion, regardless of whether
+        # the client disconnected mid-stream. Agent persistence to session DB
+        # happens inside run_conversation and is NOT affected by SSE disconnect.
+        _notify_sid = session_id
+        try:
+            if not agent_task.done():
+                await asyncio.wait_for(agent_task, timeout=60.0)
+            _result = agent_task.result() if agent_task.done() else None
+            if isinstance(_result, tuple) and isinstance(_result[0], dict):
+                _notify_sid = _result[0].get("session_id", session_id) or session_id
+        except Exception:
+            pass
+        asyncio.ensure_future(self._notify_ntfy(_notify_sid))
 
         return response
 
@@ -2986,17 +2992,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             _persist_incomplete_if_needed()
-            # Client disconnected — interrupt the agent so it stops
-            # making upstream LLM calls, but DON'T cancel the task.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
+            # Client disconnected — do NOT interrupt or cancel the agent.
+            # Let it finish so the full result is persisted to the session
+            # DB for fetch-on-resume (or ntfy push notification).
             if not agent_task.done():
-                # Do NOT cancel — let the agent complete so results
-                # persist to the session for fetch-on-resume.
                 pass
             logger.info("SSE client disconnected; agent will complete in background for response %s", response_id)
         except asyncio.CancelledError:
