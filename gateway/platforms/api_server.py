@@ -2413,12 +2413,10 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            # Client disconnected mid-stream (phone locked, app closed).
-            # Do NOT interrupt or cancel the agent — let it finish and
-            # persist its result to the session DB so fetch-on-resume
-            # (or ntfy push) can deliver it when the client reconnects.
-            logger.info(
-                "SSE client disconnected; agent will complete in background for session %s",
+            import traceback as _tb
+            logger.warning(
+                "SSE client disconnected (%s) for session %s; agent will complete in background",
+                _tb.format_exc()[-200:],
                 completion_id,
             )
         except Exception as _exc:
@@ -2444,7 +2442,10 @@ class APIServerAdapter(BasePlatformAdapter):
         _notify_sid = session_id
         try:
             if not agent_task.done():
-                await asyncio.wait_for(agent_task, timeout=60.0)
+                try:
+                    await asyncio.wait_for(agent_task, timeout=60.0)
+                except asyncio.CancelledError:
+                    pass
             _result = agent_task.result() if agent_task.done() else None
             if isinstance(_result, tuple) and isinstance(_result[0], dict):
                 _notify_sid = _result[0].get("session_id", session_id) or session_id
