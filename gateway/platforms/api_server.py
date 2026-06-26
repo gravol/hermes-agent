@@ -42,13 +42,17 @@ import re
 import sqlite3
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 try:
+    import aiohttp
     from aiohttp import web
     AIOHTTP_AVAILABLE = True
 except ImportError:
+    aiohttp = None  # type: ignore[assignment]
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
@@ -1201,6 +1205,142 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
 
+    async def _handle_transcribe(self, request: "web.Request") -> "web.Response":
+        """POST /api/transcribe — transcribe uploaded audio via Hermes STT."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            reader = await request.multipart()
+            field = await reader.next()
+            if field is None or field.name not in {"audio", "file"}:
+                return web.json_response(
+                    {"success": False, "error": "Expected multipart field 'audio'."},
+                    status=400,
+                )
+
+            filename = field.filename or "voice.m4a"
+            ext = os.path.splitext(filename)[1].lower() or ".m4a"
+            supported = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
+            if ext not in supported:
+                return web.json_response(
+                    {"success": False, "error": f"Unsupported audio extension: {ext}"},
+                    status=400,
+                )
+
+            audio_bytes = await field.read(decode=False)
+            if not audio_bytes:
+                return web.json_response(
+                    {"success": False, "error": "Uploaded audio was empty."},
+                    status=400,
+                )
+
+            from gateway.platforms.base import cache_audio_from_bytes
+            from tools.transcription_tools import transcribe_audio
+
+            cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=ext)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, transcribe_audio, cached_path)
+            return web.json_response({
+                "success": bool(result.get("success")),
+                "transcript": result.get("transcript", ""),
+                "provider": result.get("provider", ""),
+                "cached_path": cached_path,
+                "error": result.get("error", ""),
+            }, status=200 if result.get("success") else 500)
+        except Exception as exc:
+            logger.warning("API transcribe failed: %s", exc, exc_info=True)
+            return web.json_response(
+                {"success": False, "error": f"Transcription failed: {exc}"},
+                status=500,
+            )
+
+    async def _handle_obsidian_chat_append(self, request: "web.Request") -> "web.Response":
+        """POST /api/obsidian/chat — append one chat message to the Obsidian vault."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+
+        message_id = str(payload.get("id") or uuid.uuid4()).strip()
+        role = str(payload.get("role") or "").strip().lower()
+        text = str(payload.get("text") or "").strip()
+        source = str(payload.get("source") or "Hermes Chat Android").strip()[:80]
+        timestamp_ms = payload.get("timestamp")
+
+        if role not in {"user", "assistant"}:
+            return web.json_response({"error": "invalid_role"}, status=400)
+        if not text or text == "...":
+            return web.json_response({"error": "empty_text"}, status=400)
+
+        try:
+            ts = float(timestamp_ms) / 1000.0 if timestamp_ms is not None else time.time()
+        except Exception:
+            ts = time.time()
+
+        try:
+            result = await asyncio.to_thread(
+                self._append_obsidian_chat_note,
+                message_id=message_id,
+                role=role,
+                text=text,
+                source=source,
+                timestamp=ts,
+            )
+            return web.json_response(result)
+        except FileNotFoundError as exc:
+            return web.json_response({"error": "vault_not_found", "message": str(exc)}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": "invalid_request", "message": str(exc)}, status=400)
+        except Exception as exc:
+            logger.exception("Failed to append Hermes chat message to Obsidian")
+            return web.json_response({"error": "obsidian_append_failed", "message": str(exc)[:200]}, status=500)
+
+    def _append_obsidian_chat_note(
+        self,
+        *,
+        message_id: str,
+        role: str,
+        text: str,
+        source: str,
+        timestamp: float,
+    ) -> Dict[str, Any]:
+        vault = Path(os.environ.get("OBSIDIAN_VAULT_PATH") or Path.home() / "Documents" / "ObsidianVault").expanduser()
+        if not vault.exists() or not vault.is_dir():
+            raise FileNotFoundError(str(vault))
+
+        tz = ZoneInfo("America/Vancouver")
+        dt = datetime.fromtimestamp(timestamp, tz=tz)
+        folder = vault / "Hermes Chat"
+        folder.mkdir(parents=True, exist_ok=True)
+        note_path = folder / f"{dt:%Y-%m-%d}.md"
+        marker = f"<!-- hermes-chat-message:{message_id} -->"
+
+        existing = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
+        if marker in existing:
+            return {"ok": True, "skipped": True, "path": str(note_path)}
+
+        speaker = "Jeff" if role == "user" else "Hermes"
+        safe_text = text[:20000].rstrip()
+        header = "" if existing else f"# Hermes Chat — {dt:%A, %B %-d, %Y}\n\n"
+        entry = (
+            f"{header}"
+            f"{marker}\n"
+            f"## {dt:%-I:%M %p} — {speaker}\n"
+            f"_Source: {source}_\n\n"
+            f"{safe_text}\n\n"
+        )
+        with note_path.open("a", encoding="utf-8") as fh:
+            if existing and not existing.endswith("\n"):
+                fh.write("\n")
+            fh.write(entry)
+        return {"ok": True, "skipped": False, "path": str(note_path)}
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -1250,7 +1390,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
-                "audio_api": False,
+                "audio_api": True,
+                "audio_transcription": True,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
@@ -1260,6 +1401,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
+                "transcribe": {"method": "POST", "path": "/api/transcribe"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
@@ -1650,6 +1792,10 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+        # Fire ntfy push notification (fire-and-forget — never block the response)
+        asyncio.ensure_future(
+            self._notify_ntfy(effective_session_id or session_id, final_response)
+        )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -1757,6 +1903,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "messages": turn_messages,
                     "usage": usage,
                 }))
+                # Fire ntfy push notification (fire-and-forget)
+                asyncio.ensure_future(
+                    self._notify_ntfy(effective_session_id, final_response)
+                )
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": str(exc)}))
@@ -3770,6 +3920,40 @@ class APIServerAdapter(BasePlatformAdapter):
         finally:
             self._inflight_agent_runs -= 1
 
+    async def _notify_ntfy(self, session_id: str, preview: str = "") -> None:
+        """Fire-and-forget push notification via ntfy.
+
+        Posts to the self-hosted ntfy server so the Android app (or any
+        ntfy subscriber) receives a real-time push when the agent finishes
+        a turn. Configured via env vars with sensible defaults for bigred.
+        Silently ignores failures — ntfy is an optimization, not a contract.
+        """
+        ntfy_url = os.getenv("NTFY_URL", "http://localhost:8080")
+        topic = os.getenv("NTFY_TOPIC", "jeff-hermes")
+        if not topic:
+            return
+        try:
+            async with aiohttp.ClientSession() as ntfy_session:
+                await ntfy_session.post(
+                    f"{ntfy_url.rstrip('/')}/{topic}",
+                    json={
+                        "title": "Hermes Response Ready",
+                        "message": f"Session: {session_id[:16]}…",
+                        "priority": 4,
+                        "tags": ["hermes"],
+                        "actions": [
+                            {
+                                "action": "view",
+                                "label": "Open",
+                                "url": f"hermes-android://session/{session_id}",
+                            }
+                        ],
+                    },
+                    timeout=aiohttp.ClientTimeout(total=5),
+                )
+        except Exception:
+            logger.debug("[api_server] ntfy notification failed (non-fatal)")
+
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
     # ------------------------------------------------------------------
@@ -4386,6 +4570,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
+            self._app.router.add_post("/api/transcribe", self._handle_transcribe)
+            self._app.router.add_post("/api/obsidian/chat", self._handle_obsidian_chat_append)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
