@@ -1947,9 +1947,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 data = json.dumps(payload, ensure_ascii=False)
                 await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
                 last_write = time.monotonic()
-        except (asyncio.CancelledError, ConnectionResetError):
+        except asyncio.CancelledError:
+            # Server-side cancellation (shutdown, timeout) — cancel the agent
             task.cancel()
             raise
+        except ConnectionResetError:
+            # Client disconnected (app closed, phone locked) — let the agent
+            # finish so results persist to the session for fetch-on-resume.
+            logger.info(
+                "[api_server] SSE client disconnected from session chat stream; "
+                "agent will complete in background for session %s",
+                session_id,
+            )
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
@@ -2408,21 +2417,18 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
-            # stops making LLM API calls at the next loop iteration, then
-            # cancel the asyncio task wrapper.
+            # stops making new LLM API calls, but DON'T cancel the task —
+            # the agent still needs to finish and persist its result to the
+            # session so _checkPendingOnResume() can find it on reconnect.
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
                 try:
                     agent.interrupt("SSE client disconnected")
                 except Exception:
                     pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+            # Do NOT cancel agent_task — let it complete so the result
+            # is stored in the session database for fetch-on-resume.
+            logger.info("SSE client disconnected; agent will complete in background for session %s", completion_id)
         except Exception as _exc:
             # Agent crashed mid-stream.  Try to emit an error chunk
             # so the client gets a proper response instead of a
@@ -2981,7 +2987,7 @@ class APIServerAdapter(BasePlatformAdapter):
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             _persist_incomplete_if_needed()
             # Client disconnected — interrupt the agent so it stops
-            # making upstream LLM calls, then cancel the task.
+            # making upstream LLM calls, but DON'T cancel the task.
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
                 try:
@@ -2989,12 +2995,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("SSE client disconnected; interrupted agent task %s", response_id)
+                # Do NOT cancel — let the agent complete so results
+                # persist to the session for fetch-on-resume.
+                pass
+            logger.info("SSE client disconnected; agent will complete in background for response %s", response_id)
         except asyncio.CancelledError:
             # Server-side cancellation (e.g. shutdown, request timeout) —
             # persist an incomplete snapshot so GET /v1/responses/{id} and
