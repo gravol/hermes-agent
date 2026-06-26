@@ -2201,6 +2201,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
+        # Fire ntfy push notification (fire-and-forget)
+        _session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
+        asyncio.ensure_future(self._notify_ntfy(_session_id))
+
         final_response = result.get("final_response") or ""
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
@@ -2377,11 +2381,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            _eff_sid = session_id
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                if isinstance(result, dict):
+                    _eff_sid = result.get("session_id", session_id)
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+
+            # Fire ntfy push notification (fire-and-forget)
+            asyncio.ensure_future(self._notify_ntfy(_eff_sid))
 
             # Finish chunk
             finish_chunk = {
