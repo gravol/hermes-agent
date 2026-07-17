@@ -330,12 +330,53 @@ def _content_has_visible_payload(content: Any) -> bool:
     if isinstance(content, list):
         for part in content:
             if isinstance(part, dict):
-                ptype = str(part.get("type") or "").strip().lower()
-                if ptype in _TEXT_PART_TYPES and str(part.get("text") or "").strip():
+                ptype = part.get("type", "")
+                if ptype == "text" and part.get("text", "").strip():
                     return True
-                if ptype in _IMAGE_PART_TYPES:
+                if ptype in ("image_url", "image"):
                     return True
+        return False
     return False
+
+
+async def _write_sse_single_text(
+    request: "web.Request",
+    completion_id: str,
+    model_name: str,
+    created: int,
+    text: str,
+) -> "web.StreamResponse":
+    """Write a single text response as an SSE stream and return immediately.
+
+    Used by the slash command handler to deliver command output in the same
+    SSE format that streaming clients expect.  Delivers the full text as one
+    SSE chunk followed by [DONE].
+    """
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await response.prepare(request)
+    payload = json.dumps({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+        }],
+    }, ensure_ascii=False)
+    await response.write(f"data: {payload}\n\n".encode("utf-8"))
+    await response.write(b"data: [DONE]\n\n")
+    return response
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
@@ -1830,6 +1871,150 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
+    # ── Slash command helpers ───────────────────────────────────────────
+
+    async def _handle_chat_completions_slash(
+        self, text: str, *, session_id: str = "",
+    ) -> str | None:
+        """Resolve and execute a slash command, returning the response text.
+
+        Returns None if the command is not recognized (falls through to
+        the agent).  Matches the gateway's _handle_incoming_message pattern
+        but adapted for the stateless API server context.
+        """
+        # Normalize: "  /usage  " → "/usage", strip leading whitespace
+        raw = text.strip()
+        if not raw.startswith("/"):
+            return None
+
+        # Split into command name and args
+        parts = raw[1:].split(None, 1)  # first element is command after "/"
+        cmd_name = parts[0].lower() if parts else ""
+        cmd_args = parts[1] if len(parts) > 1 else ""
+
+        from hermes_cli.commands import resolve_command, COMMANDS
+
+        resolved = resolve_command(cmd_name)
+        if resolved is None:
+            return None  # not a known command — pass through to agent
+
+        canonical = resolved.name
+        _ = cmd_args  # available for command handlers that need args
+
+        # ── Info commands ───────────────────────────────────────────
+        if canonical == "help":
+            lines = [
+                "**Hermes Slash Commands** (available via API server)\n",
+                "Commands are sent as the user message starting with `/`. "
+                "Recognized commands are handled server-side. Unrecognized "
+                "commands are forwarded to the AI agent.\n",
+            ]
+            # Group by category
+            from hermes_cli.commands import COMMANDS_BY_CATEGORY
+            for cat, cmds in COMMANDS_BY_CATEGORY.items():
+                lines.append(f"**{cat.title()}**")
+                for cmd_text, desc in cmds.items():
+                    lines.append(f"  {cmd_text} — {desc}")
+                lines.append("")
+            return "\n".join(lines)
+
+        if canonical in ("version", "v"):
+            return f"Hermes Agent v{_hermes_version()}"
+
+        if canonical == "status":
+            parts_list = []
+            parts_list.append(f"**Session ID:** {session_id or 'N/A'}")
+            parts_list.append(f"**Model:** {self._model_name}")
+            # Try to get message count from session DB
+            if session_id:
+                db = self._ensure_session_db()
+                if db is not None:
+                    try:
+                        msgs = db.get_messages_as_conversation(session_id)
+                        parts_list.append(f"**Messages in session:** {len(msgs)}")
+                    except Exception:
+                        pass
+            return "\n".join(parts_list)
+
+        if canonical == "model":
+            return f"Current model: **{self._model_name}**"
+
+        if canonical == "profile":
+            import os as _prof_os
+            profile = _prof_os.getenv("HERMES_PROFILE", "default")
+            return f"Active profile: **{profile}**"
+
+        if canonical == "plugins":
+            return "**Installed plugins:** (list not available via API server)"
+
+        if canonical == "platforms":
+            return "**Platforms:** api_server (and connected gateway platforms)"
+
+        if canonical == "usage":
+            return await self._handle_usage_via_api(session_id)
+
+        if canonical == "credits":
+            try:
+                from agent.account_usage import nous_credits_lines
+                lines = await asyncio.to_thread(nous_credits_lines, markdown=True)
+                return "**Credits / Balance**\n" + "\n".join(lines) if lines else "Credits info not available."
+            except Exception:
+                return "Credits info not available via API server."
+
+        if canonical == "insights":
+            return "Usage analytics not available via API server."
+
+        # ── Session commands (feedback to user) ─────────────────────
+        if canonical in ("new", "reset", "clear"):
+            return (
+                f"`/{canonical}` would start a new session. "
+                "Send a new request without `X-Hermes-Session-Id` to begin "
+                "a fresh conversation, or use the client's /new command."
+            )
+
+        if canonical == "retry":
+            return (
+                "`/retry` is handled client-side — your app should "
+                "re-send the last user message."
+            )
+
+        if canonical == "stop":
+            return (
+                "`/stop` interrupts the current agent. "
+                "Send a new request with the same session ID to continue."
+            )
+
+        # ── Uncategorized — pass through to agent ───────────────────
+        return None
+
+    async def _handle_usage_via_api(self, session_id: str) -> str:
+        """Fetch usage data for the given session from the session DB."""
+        lines = ["**Session Usage**\n"]
+
+        if session_id:
+            db = self._ensure_session_db()
+            if db is not None:
+                try:
+                    session_data = db.get_session(session_id) or {}
+                    input_tokens = session_data.get("input_tokens", 0) or 0
+                    output_tokens = session_data.get("output_tokens", 0) or 0
+                    total = input_tokens + output_tokens
+                    api_calls = session_data.get("api_calls", 0) or 0
+                    lines.append(f"• **Input tokens:** {input_tokens:,}")
+                    lines.append(f"• **Output tokens:** {output_tokens:,}")
+                    lines.append(f"• **Total tokens:** {total:,}")
+                    lines.append(f"• **API calls:** {api_calls}")
+                    model = session_data.get("model", self._model_name)
+                    lines.append(f"• **Model:** {model}")
+                except Exception:
+                    lines.append("(session data unavailable)")
+            else:
+                lines.append("(session database not available)")
+        else:
+            lines.append("(no session ID — send messages first)")
+
+        return "\n".join(lines)
+
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         auth_err = self._check_auth(request)
@@ -1962,6 +2147,36 @@ class APIServerAdapter(BasePlatformAdapter):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+
+        # ── Slash command dispatch for chat-completions clients ──────────
+        # Telegram/Discord gateways intercept / commands before the agent
+        # loop via platform-specific dispatch in _handle_incoming_message.
+        # The OpenAI-compatible endpoint passes everything as a plain user
+        # message — so we check for known commands here and handle them
+        # directly before calling _run_agent.
+        _slash_text = user_message if isinstance(user_message, str) else ""
+        if _slash_text.startswith("/"):
+            slash_response = await self._handle_chat_completions_slash(
+                _slash_text, session_id=session_id or "",
+            )
+            if slash_response is not None:
+                if stream:
+                    return await _write_sse_single_text(
+                        request, completion_id, model_name, created,
+                        slash_response,
+                    )
+                return web.json_response({
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": slash_response},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                })
 
         if stream:
             import queue as _q

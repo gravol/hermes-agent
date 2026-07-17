@@ -1329,15 +1329,36 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 
 def _sess_nowait(params, rid):
-    s = _sessions.get(params.get("session_id") or "")
-    return (s, None) if s else (None, _err(rid, 4001, "session not found"))
+    """Look up a session and return (session, resolved_sid, err).
+
+    Accepts either a live sid (``332caa7b``) or a DB session key
+    (``20260717_144557_ffb16939``).  When a DB key is provided the
+    live sid is resolved transparently so downstream callers always
+    receive the canonical short id.
+    """
+    sid = params.get("session_id") or ""
+    s = _sessions.get(sid)
+    if s is None:
+        # Clients may reference a session by its stable DB key rather than
+        # the short live sid — e.g. after session.list or when they kept the
+        # original session_id from session.create/session.resume rather than
+        # the returned live sid.  Fall back to a key scan so prompt.submit
+        # and similar RPCs work with either identifier.
+        try:
+            live = _find_live_session_by_key(sid)
+            if live is not None:
+                resolved_sid, session = live
+                return (session, resolved_sid, None)
+        except Exception:
+            pass
+    return (s, sid, None) if s else (None, sid, _err(rid, 4001, "session not found"))
 
 
 def _sess(params, rid):
-    s, err = _sess_nowait(params, rid)
+    s, sid, err = _sess_nowait(params, rid)
     if err:
         return (None, err)
-    _start_agent_build(params.get("session_id") or "", s)
+    _start_agent_build(sid, s)
     return (s, _wait_agent(s, rid))
 
 
@@ -5326,6 +5347,7 @@ def _(rid, params: dict) -> dict:
         except Exception:
             tip = target
         if tip and tip != target:
+            logger.info("session.resume: %s -> %s (resolve_resume_session_id)", target, tip)
             target = tip
             found = db.get_session(target) or found
 
@@ -5624,7 +5646,7 @@ def _(rid, params: dict) -> dict:
 
 @method("session.cwd.set")
 def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     if session.get("running"):
@@ -5825,7 +5847,7 @@ def _(rid, params: dict) -> dict:
     returns enough state for Ink to redraw around another live session id.
     """
     sid = str(params.get("session_id") or "")
-    session, err = _sess_nowait({"session_id": sid}, rid)
+    session, _sid_resolved, err = _sess_nowait({"session_id": sid}, rid)
     if err:
         return err
     assert session is not None
@@ -5885,7 +5907,7 @@ def _(rid, params: dict) -> dict:
 
 @method("session.title")
 def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     db = _get_db()
@@ -6056,7 +6078,7 @@ def _(rid, params: dict) -> dict:
     home channel, and forges a synthetic turn. The desktop then polls
     ``handoff.state`` for the terminal result.
     """
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     if session.get("running"):
@@ -6141,7 +6163,7 @@ def _(rid, params: dict) -> dict:
     ``pending|running|completed|failed`` (or empty when no handoff record
     exists). Desktop polls this after ``handoff.request``.
     """
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     with _session_db(session) as db:
@@ -6167,7 +6189,7 @@ def _(rid, params: dict) -> dict:
     Desktop calls this when its bounded poll times out. Only pending/running
     rows are changed so a late success from the gateway watcher is not clobbered.
     """
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     reason = str(params.get("error") or "handoff failed").strip()[:500]
@@ -6186,7 +6208,7 @@ def _(rid, params: dict) -> dict:
 
 @method("session.usage")
 def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     agent = session.get("agent")
@@ -6212,7 +6234,7 @@ def _(rid, params: dict) -> dict:
 
 @method("session.context_breakdown")
 def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     agent = session.get("agent")
@@ -7470,7 +7492,7 @@ def _(rid, params: dict) -> dict:
 
 @method("session.status")
 def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
 
@@ -7527,7 +7549,7 @@ def _(rid, params: dict) -> dict:
 
 @method("session.history")
 def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     history = list(session.get("history", []))
@@ -8091,7 +8113,7 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     agent = session.get("agent")
@@ -8106,7 +8128,7 @@ def _(rid, params: dict) -> dict:
 
 @method("terminal.resize")
 def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     session["cols"] = int(params.get("cols", 80))
@@ -8120,9 +8142,11 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
-    session, err = _sess_nowait(params, rid)
+    session, sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
+    # Use the canonical live sid for all downstream operations
+    sid = sid_resolved
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
@@ -9505,7 +9529,7 @@ def _(rid, params: dict) -> dict:
 
 @method("input.detect_drop")
 def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
+    session, _sid_resolved, err = _sess_nowait(params, rid)
     if err:
         return err
     try:

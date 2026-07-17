@@ -3976,6 +3976,185 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
     assert captured["prompt"] == "expanded prompt"
 
 
+# ── Session ID normalization ─────────────────────────────────────────
+
+
+def test_sess_nowait_returns_resolved_sid_for_live_sid():
+    """A live sid lookup returns (session, sid, None) — resolved_sid matches."""
+    server._sessions["abc12345"] = _session()
+    try:
+        session, resolved_sid, err = server._sess_nowait(
+            {"session_id": "abc12345"}, "r1"
+        )
+        assert err is None
+        assert session is not None
+        assert resolved_sid == "abc12345", (
+            f"expected live sid, got {resolved_sid!r}"
+        )
+    finally:
+        server._sessions.pop("abc12345", None)
+
+
+def test_sess_nowait_resolves_db_key_to_live_sid():
+    """A DB session key lookup returns the session with the correct live sid."""
+    server._sessions["def67890"] = _session(session_key="20260601_120000_deadbeef")
+    try:
+        session, resolved_sid, err = server._sess_nowait(
+            {"session_id": "20260601_120000_deadbeef"}, "r2"
+        )
+        assert err is None
+        assert session is not None
+        assert resolved_sid == "def67890", (
+            f"expected live sid def67890, got {resolved_sid!r}"
+        )
+    finally:
+        server._sessions.pop("def67890", None)
+
+
+def test_sess_nowait_returns_error_for_unknown_sid():
+    """An unrecognised session_id returns a 4001 error."""
+    session, resolved_sid, err = server._sess_nowait(
+        {"session_id": "nonexistent"}, "r3"
+    )
+    assert session is None
+    assert err is not None
+    assert err.get("error", {}).get("code") == 4001
+
+
+def test_sess_nowait_returns_sid_for_agent_session_id():
+    """When the session has an agent with session_id, resolved_sid matches."""
+    agent = types.SimpleNamespace(session_id="agent-sid")
+    server._sessions["ghi90123"] = _session(agent=agent)
+    try:
+        session, resolved_sid, err = server._sess_nowait(
+            {"session_id": "ghi90123"}, "r4"
+        )
+        assert err is None
+        assert resolved_sid == "ghi90123"
+    finally:
+        server._sessions.pop("ghi90123", None)
+
+
+def test_prompt_submit_with_live_sid(monkeypatch):
+    """prompt.submit works with a direct live sid."""
+    built_agent_sid = []
+    captured = {}
+
+    class _Agent:
+        def run_conversation(self, prompt, **kwargs):
+            captured["prompt"] = prompt
+            return {"final_response": "ok", "messages": [{"role": "assistant", "content": "ok"}]}
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    def capture_build(sid, session):
+        built_agent_sid.append(sid)
+
+    server._sessions["live-sid"] = _session(
+        agent=_Agent(), session_key="20260601_120000_deadbeef"
+    )
+    monkeypatch.setattr(server, "_start_agent_build", capture_build)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server._wait_agent, "__defaults__", (None,))
+
+    try:
+        resp = server.handle_request({
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "live-sid", "text": "hello"},
+        })
+        assert resp["result"]["status"] == "streaming", f"unexpected resp: {resp}"
+        assert built_agent_sid == ["live-sid"], (
+            f"_start_agent_build called with {built_agent_sid}"
+        )
+    finally:
+        server._sessions.pop("live-sid", None)
+
+
+def test_prompt_submit_with_db_session_key(monkeypatch):
+    """prompt.submit works when the client passes a DB session key."""
+    built_agent_sid = []
+    captured = {}
+
+    class _Agent:
+        def run_conversation(self, prompt, **kwargs):
+            captured["prompt"] = prompt
+            return {"final_response": "ok", "messages": [{"role": "assistant", "content": "ok"}]}
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    def capture_build(sid, session):
+        built_agent_sid.append(sid)
+
+    live_sid = "db-key-live"
+    db_key = "20260717_144557_ffb16939"
+    server._sessions[live_sid] = _session(
+        agent=_Agent(), session_key=db_key
+    )
+    monkeypatch.setattr(server, "_start_agent_build", capture_build)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server._wait_agent, "__defaults__", (None,))
+
+    try:
+        resp = server.handle_request({
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": db_key, "text": "hello via DB key"},
+        })
+        assert resp["result"]["status"] == "streaming", f"unexpected resp: {resp}"
+        assert built_agent_sid == [live_sid], (
+            f"_start_agent_build called with {built_agent_sid}, expected {[live_sid]}"
+        )
+    finally:
+        server._sessions.pop(live_sid, None)
+
+
+def test_sess_resolves_db_key(monkeypatch):
+    """_sess() resolves a DB session key and starts agent build with live sid."""
+    built_sid = []
+
+    def capture_build(sid, session):
+        built_sid.append(sid)
+
+    live_sid = "sess-db-key-live"
+    db_key = "20260523_044122_9dd74fd7"
+    ready = threading.Event()
+    ready.set()
+    server._sessions[live_sid] = _session(
+        session_key=db_key, agent_ready=ready
+    )
+    monkeypatch.setattr(server, "_start_agent_build", capture_build)
+    monkeypatch.setattr(server, "_wait_agent", lambda s, r: None)
+
+    try:
+        session, err = server._sess(
+            {"session_id": db_key}, "r5"
+        )
+        assert err is None
+        assert session is not None
+        assert built_sid == [live_sid], (
+            f"_start_agent_build called with {built_sid}, expected {[live_sid]}"
+        )
+    finally:
+        server._sessions.pop(live_sid, None)
+
+
 def test_image_attach_appends_local_image(monkeypatch):
     fake_cli = types.ModuleType("cli")
     fake_cli._IMAGE_EXTENSIONS = {".png"}
