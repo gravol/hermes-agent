@@ -584,7 +584,23 @@ def _(rid, params: dict) -> dict:
         mark_speech_interrupted()
     session, err = _sess_nowait(params, rid)
     if err:
-        return err
+        # Session-scoped RPC hit a runtime id the gateway no longer holds (detached on WS
+        # disconnect and orphan-reaped, LRU-evicted, or torn down after an idle TTL). Clients
+        # that send the STORED db key (Hermex Android always does; see DashboardChatViewModel)
+        # have no live sid to fall back to, so unlike approval.respond they 4001 unconditionally.
+        # Resolve by durable identity before failing — same fallback approval.respond already uses.
+        # Update BOTH sid and session: the handler later re-binds via _reattach_refusal(rid, sid,
+        # session), which checks `_sessions.get(sid) is session`, so a stale sid would 4007 instead.
+        if (err.get("error") or {}).get("code") == 4001:
+            try:
+                live = _find_live_session_by_key(sid)
+                if live is not None:
+                    sid, session = live
+                    err = None
+            except Exception:
+                logger.debug("prompt.submit stored-id fallback failed", exc_info=True)
+        if err:
+            return err
     from tools.bot_relay import DeliveryAuthor
 
     # Only the relay handler can build a DeliveryAuthor. A dict here is a client claiming a sender.
