@@ -120,7 +120,11 @@ def _session_row_summary(row: dict, *, tip_row: dict | None = None, resolved_id=
     return {"id": row["id"], **({} if resolved_id is None else {"resolved_id": resolved_id}),
             "title": row.get("title") or "", "preview": tip_row.get("preview") or "",
             "started_at": row.get("started_at") or 0, "message_count": tip_row.get("message_count") or 0,
-            "source": row.get("source") or ""}
+            "source": row.get("source") or "",
+            # Token totals for the Insights panel (per-model day/week/month aggregation). The compact
+            # sessions projection already carries these columns; surface them so the client can sum.
+            "input_tokens": row.get("input_tokens") or 0,
+            "output_tokens": row.get("output_tokens") or 0}
 
 
 from hermes_state_sessions import INTERNAL_LISTING_SOURCES
