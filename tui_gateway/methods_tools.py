@@ -890,6 +890,42 @@ def _(rid, params: dict) -> dict:
     base = (parts[0] if parts else "").lower()
     arg = parts[1] if len(parts) > 1 else ""
     sid = params.get("session_id", "")
+
+    # /yolo — toggle session approval-bypass in the GATEWAY process, not the
+    # slash worker. The worker is a separate subprocess with its own copy of
+    # tools.approval._session_yolo, so a toggle there would never be seen by
+    # _session_info() (which reads the gateway's dict) or by the enforcement
+    # path. Handle it inline so the flag, session.info, and enforcement all
+    # agree. Broadcast so a live client's optimistic pill flips to match.
+    if base == "yolo":
+        try:
+            from tools.approval import (
+                disable_session_yolo, enable_session_yolo, is_session_yolo_enabled,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            return _err(rid, 5030, f"yolo toggle failed: {e}")
+        key = session.get("session_key", "") if session else ""
+        enabled = is_session_yolo_enabled(key) if key else False
+        if enabled:
+            disable_session_yolo(key)
+            new_state = False
+        else:
+            enable_session_yolo(key)
+            new_state = True
+        # Reflect immediately on the live agent so enforcement honours it this turn.
+        agent = session.get("agent") if session else None
+        if agent is not None:
+            try:
+                from agent.approval_context import _set_approval_mode  # noqa: F401
+            except Exception:
+                pass
+        try:
+            if session is not None:
+                _emit("session.info", sid, _session_info(agent, session))
+        except Exception:
+            pass
+        return _ok(rid, {"output": "  ⚡ YOLO mode " + ("ON" if new_state else "OFF")})
+
     live_output = _live_slash_command_output(sid, session, base, arg)
     if live_output is not None:
         return _ok(rid, {"output": live_output or "(no output)"})
