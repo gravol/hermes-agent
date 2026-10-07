@@ -2616,6 +2616,10 @@ export interface SessionListRow {
   started_at?: number
   message_count?: number
   source?: string
+  model?: string
+  input_tokens?: number
+  output_tokens?: number
+  last_activity_at?: number | null
 }
 export interface SessionMostRecentParams {
   profile?: string | null

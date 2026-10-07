@@ -200,6 +200,12 @@ class SessionListRow(Result):
     started_at: float = 0
     message_count: int = 0
     source: str = ""
+    # Insights panel fields: per-model grouping + token totals + last-activity clock for
+    # DAY/WEEK/MONTH buckets (None on pre-feature rows; clients fall back to started_at).
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    last_activity_at: float | None = None
 
 
 class SessionListResult(Result):

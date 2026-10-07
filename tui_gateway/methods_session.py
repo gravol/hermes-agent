@@ -121,10 +121,18 @@ def _session_row_summary(row: dict, *, tip_row: dict | None = None, resolved_id=
             "title": row.get("title") or "", "preview": tip_row.get("preview") or "",
             "started_at": row.get("started_at") or 0, "message_count": tip_row.get("message_count") or 0,
             "source": row.get("source") or "",
+            # Model id so the Insights panel can group usage per model (was missing — everything
+            # grouped under "Unknown").
+            "model": row.get("model") or "",
             # Token totals for the Insights panel (per-model day/week/month aggregation). The compact
             # sessions projection already carries these columns; surface them so the client can sum.
             "input_tokens": row.get("input_tokens") or 0,
-            "output_tokens": row.get("output_tokens") or 0}
+            "output_tokens": row.get("output_tokens") or 0,
+            # Last-activity clock for the Insights DAY/WEEK/MONTH buckets. Sessions are judged by
+            # started_at otherwise — a session started in the evening and used for days vanishes
+            # from DAY, and started_at anchors to midnight UTC, so "today" is empty for local
+            # evening schedules. None for pre-feature rows; clients fall back to started_at.
+            "last_activity_at": row.get("last_activity_at")}
 
 
 from hermes_state_sessions import INTERNAL_LISTING_SOURCES
