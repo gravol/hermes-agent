@@ -1416,6 +1416,69 @@ def test_command_dispatch_queue_sends_message(server):
     assert result["message"] == "tell me about quantum computing"
 
 
+def test_command_dispatch_queue_while_running_enqueues(server):
+    """/queue on a RUNNING session must enqueue (drained at turn end), never {type:'send'}:
+    a send re-submits via prompt.submit, where busy_input_mode (default interrupt) redirects
+    it into the live turn — the force-send /queue exists to prevent."""
+    import threading
+    sid = "test-session-queue-busy"
+    server._sessions[sid] = {
+        "session_key": sid, "agent": None, "running": True,
+        "history_lock": threading.Lock(), "transport": None}
+
+    resp = server.handle_request({
+        "id": "r1", "method": "command.dispatch",
+        "params": {"name": "queue", "arg": "do this next", "session_id": sid},
+    })
+
+    assert "error" not in resp
+    result = resp["result"]
+    assert result["type"] == "exec" and "Queued" in (result.get("output") or "")
+    queued_env = server._sessions[sid].get("queued_prompt")
+    assert queued_env and queued_env["text"] == "do this next"
+
+
+def test_command_dispatch_steer_without_live_agent_queues(server):
+    """/steer while running with no steerable agent must queue, not fall through to
+    {type:'send'} (which busy_input_mode would redirect = force-send)."""
+    import threading
+    sid = "test-session-steer-busy"
+    server._sessions[sid] = {
+        "session_key": sid, "agent": None, "running": True,
+        "history_lock": threading.Lock(), "transport": None}
+
+    resp = server.handle_request({
+        "id": "r1", "method": "command.dispatch",
+        "params": {"name": "steer", "arg": "use the second file", "session_id": sid},
+    })
+
+    assert "error" not in resp
+    result = resp["result"]
+    assert result["type"] == "exec" and "queued" in (result.get("output") or "").lower()
+    assert server._sessions[sid]["queued_prompt"]["text"] == "use the second file"
+
+
+def test_command_dispatch_steer_with_steerable_agent_uses_agent_steer(server):
+    """/steer with a live steerable agent injects via agent.steer — no queue envelope, no send."""
+    import threading
+    sid = "test-session-steer-agent"
+    steered = []
+    agent = types.SimpleNamespace(steer=lambda t: steered.append(t) or True)
+    server._sessions[sid] = {
+        "session_key": sid, "agent": agent, "running": True,
+        "history_lock": threading.Lock(), "transport": None}
+
+    resp = server.handle_request({
+        "id": "r1", "method": "command.dispatch",
+        "params": {"name": "steer", "arg": "watch the quoting", "session_id": sid},
+    })
+
+    assert "error" not in resp
+    assert resp["result"]["type"] == "exec" and "Steer queued" in resp["result"]["output"]
+    assert steered == ["watch the quoting"]
+    assert "queued_prompt" not in server._sessions[sid]
+
+
 def test_skills_manage_search_uses_tools_hub_sources(server):
     result = type("Result", (), {
         "description": "Build better terminal demos",

@@ -622,7 +622,20 @@ def _dispatch_skill(rid, params, session, name, arg):
 
 
 def _cmd_queue(rid, params, session, name, arg):
-    return _ok(rid, {"type": "send", "message": arg}) if arg else _err(rid, 4004, "usage: /queue <prompt>")
+    if not arg:
+        return _err(rid, 4004, "usage: /queue <prompt>")
+    # Idle: /queue is just the next message — send it.
+    if not session or not session.get("running"):
+        return _ok(rid, {"type": "send", "message": arg})
+    # Running: honor the queue promise. {type:"send"} re-submits via prompt.submit, where
+    # busy_input_mode (default "interrupt") REDIRECTS it into the live turn — the exact
+    # force-send /queue exists to prevent. Enqueue server-side instead; drained at turn end.
+    with session["history_lock"]:
+        if not session.get("running"):
+            return _ok(rid, {"type": "send", "message": arg})
+        _enqueue_prompt(session, arg, current_transport() or _stdio_transport)
+        session["last_active"] = time.time()
+    return _exec_out(rid, "⏳ Queued for the next turn.")
 
 
 def _prompt_builtin(module: str, fn: str, kw: str = ""):
@@ -729,6 +742,15 @@ def _cmd_steer(rid, params, session, name, arg):
             if agent.steer(arg):
                 shown = f"{arg[:80]}{'...' if len(arg) > 80 else ''}"
                 return _exec_out(rid, f"⏩ Steer queued — arrives after the next tool call: {shown}")
+    if session and session.get("running"):
+        # Running with no steerable agent in this process (turn-build window, compute-host session):
+        # queue it. {type:"send"} here meant busy_input_mode (default interrupt) redirecting it into
+        # the live turn — /steer never means "force send".
+        with session["history_lock"]:
+            if session.get("running"):
+                _enqueue_prompt(session, arg, current_transport() or _stdio_transport)
+                session["last_active"] = time.time()
+                return _exec_out(rid, "⏳ No live tool batch to steer into — queued for the next turn.")
     return _ok(rid, {"type": "send", "message": arg})  # no active run: next-turn message
 
 
