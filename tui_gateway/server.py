@@ -1130,10 +1130,28 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
+def _resolve_live_sid(sid: str) -> tuple[str, dict | None]:
+    """Resolve a session_id param to (live runtime sid, session): direct runtime-id lookup first,
+    then a session_key scan — clients (phone, dashboard) legitimately address stored DB keys, and a
+    key-only lookup returned a spurious 4001 even while the session was live (file.attach 4001 loop,
+    2026-10-08: resume succeeded → liveSid=63bdffd1, attach retried with the DB key → 4001 again)."""
+    s = _sessions.get(sid)
+    if s is not None:
+        return sid, s
+    with _sessions_lock:
+        for live_sid, sess in _sessions.items():
+            if sess.get("session_key") == sid:
+                return live_sid, sess
+    return "", None
+
+
 def _sess_nowait(params, rid):
     sid = params.get("session_id") or ""
-    s = _sessions.get(sid)
+    live_sid, s = _resolve_live_sid(sid)
     if s:
+        # Canonicalize to the runtime id so _start_agent_build/_sess_building's sid-keyed work
+        # (warm builds, emits) targets the live session, not the stored key.
+        params["session_id"] = live_sid
         return (s, None)
     # Stale runtime id (reaped/evicted/TTL): the client should session.resume the STORED id. Logged so
     # "message vanished" reads as "arrived and was rejected".
