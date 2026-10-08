@@ -85,3 +85,35 @@ class TestSessNowaitKeyResolution:
         s, err = server._sess_building(params, "r4")
         assert err is None
         assert built == [LIVE_SID]
+
+
+class TestStoredKeySubmitReattach:
+    """prompt.submit addressed by the STORED key must pass the guarded reuse (no 4007).
+
+    2026-10-08: _sess_nowait canonicalizes params['session_id'] to the live runtime sid, but the
+    local ``sid`` prompt.submit read BEFORE the call stayed the stored key — so _reattach_refusal
+    (``_sessions.get(sid) is session``) refused a live session with 4007 "session no longer live;
+    retry resume". Reproduced live against the dashboard: session.create -> submit(live sid) OK ->
+    submit(stored key) 4007. This is the Hermex Android submit shape (it always sends the DB key).
+    """
+
+    def test_stored_key_submit_reaches_turn_machinery(self, server, monkeypatch):
+        import threading
+
+        handler = server._methods["prompt.submit"]
+
+        server._sessions[LIVE_SID] = {
+            "agent": None,
+            "session_key": DB_KEY,
+            "running": False,
+            "history_lock": threading.Lock(),
+        }
+        # Handlers from split modules are rebound onto server globals (method_ctx.bind_module),
+        # so their dependencies live on the server module — patch there.
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda sid, s: None)
+        sentinel = server._err("r-t1", 9999, "reached turn machinery")
+        monkeypatch.setattr(server, "_lock_in_submit_turn", lambda *a, **k: (sentinel, None))
+
+        r = handler("r-t1", {"session_id": DB_KEY, "text": "test"})
+        assert (r.get("error") or {}).get("code") == 9999, (
+            "stored-key submit must sail past _reattach_refusal instead of 4007; got %r" % (r,))

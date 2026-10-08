@@ -596,11 +596,17 @@ def _(rid, params: dict) -> dict:
                 live = _find_live_session_by_key(sid)
                 if live is not None:
                     sid, session = live
+                    params["session_id"] = sid
                     err = None
             except Exception:
                 logger.debug("prompt.submit stored-id fallback failed", exc_info=True)
         if err:
             return err
+    # _sess_nowait canonicalizes a stored-key resolve to the live runtime sid (params rewritten);
+    # re-sync the local — the guarded reuse below checks `_sessions.get(sid) is session` and 4007s
+    # on a stale stored key even while the session is live (2026-10-08: stored-key submit after
+    # resume -> "session no longer live; retry resume", reproduced from session.create).
+    sid = params.get("session_id") or sid
     from tools.bot_relay import DeliveryAuthor
 
     # Only the relay handler can build a DeliveryAuthor. A dict here is a client claiming a sender.
