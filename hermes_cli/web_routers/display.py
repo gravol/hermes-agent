@@ -211,10 +211,20 @@ async def _bridge(ws: WebSocket, info: dict) -> None:
         await evicted.wait()
         await ws.close(code=_CLOSE_CONTROL_TAKEN, reason="control-taken")
 
-    tasks = [asyncio.create_task(rfb_to_ws()), asyncio.create_task(ws_to_rfb()),
-             asyncio.create_task(watch_eviction())]
+    tasks = [asyncio.create_task(rfb_to_ws(), name="rfb_to_ws"),
+             asyncio.create_task(ws_to_rfb(), name="ws_to_rfb"),
+             asyncio.create_task(watch_eviction(), name="watch_eviction")]
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        # Which pump ended decides what the viewer sees: rfb_to_ws = Xvnc EOF, ws_to_rfb = the
+        # viewer's own socket, watch_eviction = a lease takeover. Without this the viewer's
+        # "blank screen, Retry" has no server-side cause to match it against.
+        _log.warning(
+            "display ws bridge ended: profile=%s viewer=%s ended_by=%s exc=%r",
+            profile_key, viewer_id,
+            ",".join(sorted(t.get_name() for t in done)),
+            next((t.exception() for t in done if not t.cancelled() and t.exception()), None),
+        )
         for t in pending:
             t.cancel()
         # Cancelled pumps must finish before we tear down the socket they hold, or they outlive the
