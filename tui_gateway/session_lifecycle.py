@@ -744,6 +744,8 @@ def _interrupt_session_turn(
                 if session.get("running"):
                     session["running"] = False
                     _clear_inflight_turn(session)
+                    from tui_gateway.server import _trace_bind  # Phase 0 trace (log-only)
+                    _trace_bind(sid, "turn_end", session.get("transport"), "stop")
     # Sibling of the #102895 finalize-path fix above: an explicit /stop (or the WS-orphan reaper's
     # interrupt-at-grace) must also reach a background memory/skill review, not just the foreground
     # turn. The review fork is invisible to `should_interrupt`/`run_thread_alive` above (both gated
@@ -838,8 +840,12 @@ def _rebind_live_transport(sid: str, session: dict, transport: Transport) -> Non
         with _sessions_lock:
             if _ws_session_is_detached(session) and sid not in _pending_ws_reaps:
                 _schedule_ws_orphan_reap(sid)
+        from tui_gateway.server import _trace_bind  # Phase 0 trace (log-only)
+        _trace_bind(sid, "rebind_skipped", transport, "transport_dead")
         return
     _attach_session_transport(session, transport)
+    from tui_gateway.server import _trace_bind  # Phase 0 trace (log-only)
+    _trace_bind(sid, "rebind", transport, "attach")
     # Every transport that showed this session (pop-outs resume the same sid); on disconnect the last
     # viewer becomes the transport instead of the drop sentinel.
     session.setdefault("viewers", {})[transport] = time.time()
@@ -1043,6 +1049,8 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
                     _rebind_live_transport(sid, current, live[-1])
                 else:
                     current["transport"] = _detached_ws_transport
+                    from tui_gateway.server import _trace_bind  # Phase 0 trace (log-only)
+                    _trace_bind(sid, "detach", transport, "ws_disconnect")
                     current.pop("_client_gone_interrupt_requested", None)
                     current.pop("_client_gone_interrupt_polls", None)
                     should_schedule_reap = True

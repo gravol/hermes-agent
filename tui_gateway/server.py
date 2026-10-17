@@ -234,6 +234,42 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 _detached_ws_transport = _DropTransport()
 
 
+# Phase 0 trace (Hermex frozen-card investigation, 2026-10-17). Log-only: records where
+# each outgoing frame was routed, so a mid-turn WS drop can be classified as "frame
+# dropped because the session had no transport" versus "frame delivered, client ignored
+# it". Writes ids/counts/states only — never payload content. Remove once the failure
+# bucket is settled.
+_FRAME_TRACE_PATH = os.path.expanduser("~/.hermes/logs/gateway_frame_trace.log")
+_frame_trace_lock = threading.Lock()
+
+
+def _trace_frame(sid: str, obj: dict, route: str) -> None:
+    try:
+        params = obj.get("params")
+        p = params if isinstance(params, dict) else {}
+        seq = p.get("seq")
+        etype = p.get("type")
+        rid = obj.get("id")
+        line = (f"{time.time_ns() // 1000} sid={str(sid)[:8]} seq={seq} type={etype} "
+                f"id={str(rid)[:12]} route={route}\n")
+        with _frame_trace_lock:
+            with open(_FRAME_TRACE_PATH, "a") as fh:
+                fh.write(line)
+    except Exception:
+        pass
+
+
+def _trace_bind(sid: str, action: str, transport, reason: str) -> None:
+    try:
+        line = (f"{time.time_ns() // 1000} sid={str(sid)[:8]} {action} "
+                f"transport={id(transport):x} reason={reason}\n")
+        with _frame_trace_lock:
+            with open(_FRAME_TRACE_PATH, "a") as fh:
+                fh.write(line)
+    except Exception:
+        pass
+
+
 def _prepend_tool_paths(env: dict[str, str]) -> dict[str, str]:
     """Prepend managed bin (managed-first policy for the Browser Use CLI), venv bin and
     ~/.local/bin to PATH so slash_worker children resolve Hermes-managed CLIs under the Desktop's minimal PATH.
@@ -691,9 +727,14 @@ def write_json(obj: dict) -> bool:
         # owning session's transport. A room member's hidden session has no transport: its frames would
         # die at stdio below.
         project_room_member_activity(obj, _sessions)
-        sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
+        sid = ((params or {}).get("session_id") or "") if isinstance(params, dict) else ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
+            _trace_frame(sid, obj, "session_transport")
             return t.write(obj)
+        # Phase 0 trace: no owning transport, so the frame falls through to the request's
+        # transport / stdio — for a dashboard WS client that means the phone never sees it.
+        # This line is what decides whether the frozen card is a server-side drop.
+        _trace_frame(sid, obj, "no_session_transport")
     return (current_transport() or _stdio_transport).write(obj)
 
 

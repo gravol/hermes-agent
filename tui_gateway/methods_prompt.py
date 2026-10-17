@@ -722,6 +722,8 @@ def _lock_in_submit_turn(
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
+        from tui_gateway.server import _trace_bind  # Phase 0 trace (log-only)
+        _trace_bind(sid, "turn_start", session.get("transport"), "prompt_submit")
         if hosted_task is not None:
             session["_hosted_room_task"] = dict(hosted_task)
         _start_inflight_turn(session, text, display_kind=display_kind)
