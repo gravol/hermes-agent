@@ -239,19 +239,22 @@ _detached_ws_transport = _DropTransport()
 # dropped because the session had no transport" versus "frame delivered, client ignored
 # it". Writes ids/counts/states only — never payload content. Remove once the failure
 # bucket is settled.
+# Phase 1 (same investigation): joinable identity + write results. Each WS connection is
+# minted a short ``cid`` by the gateway (tui_gateway.ws.handle_ws) and it is echoed to the
+# client in the gateway.ready payload; every trace line that names a transport also names
+# its cid, and a connect/close pair brackets each connection with its peer address.
+# Per-frame write results (queued vs written, byte count, exception class — captured at
+# enqueue time by the route line, at completion by write_done/ws_batch lines, so a rebind
+# landing between the two is visible) are opt-in via HERMES_TUI_FRAME_WRITE_TRACE=1 because
+# they double the frame-line volume. Honest limit: the gateway cannot observe whether the
+# remote client CONSUMED the bytes; the strongest signal here is "handed to the event loop /
+# accepted by send_text".
 _FRAME_TRACE_PATH = os.path.expanduser("~/.hermes/logs/gateway_frame_trace.log")
 _frame_trace_lock = threading.Lock()
 
 
-def _trace_frame(sid: str, obj: dict, route: str) -> None:
+def _frame_trace_line(line: str) -> None:
     try:
-        params = obj.get("params")
-        p = params if isinstance(params, dict) else {}
-        seq = p.get("seq")
-        etype = p.get("type")
-        rid = obj.get("id")
-        line = (f"{time.time_ns() // 1000} sid={str(sid)[:8]} seq={seq} type={etype} "
-                f"id={str(rid)[:12]} route={route}\n")
         with _frame_trace_lock:
             with open(_FRAME_TRACE_PATH, "a") as fh:
                 fh.write(line)
@@ -259,13 +262,77 @@ def _trace_frame(sid: str, obj: dict, route: str) -> None:
         pass
 
 
+def _conn_cid(transport) -> str:
+    """The gateway-minted connection id of *transport*; '-' for stdio/drop/sentinel sinks."""
+    return str(getattr(transport, "cid", "") or "-")
+
+
+def _write_trace_enabled() -> bool:
+    """Opt-in per-frame write-result lines (HERMES_TUI_FRAME_WRITE_TRACE=1)."""
+    return (os.environ.get("HERMES_TUI_FRAME_WRITE_TRACE") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _frame_trace_ids(obj: dict) -> tuple:
+    params = obj.get("params")
+    p = params if isinstance(params, dict) else {}
+    return p.get("seq"), p.get("type"), str(obj.get("id"))[:12]
+
+
+def _trace_frame(sid: str, obj: dict, route: str, transport=None) -> None:
+    try:
+        seq, etype, rid = _frame_trace_ids(obj)
+        line = (f"{time.time_ns() // 1000} sid={str(sid)[:8]} seq={seq} type={etype} "
+                f"id={rid} route={route} cid={_conn_cid(transport)}\n")
+        _frame_trace_line(line)
+    except Exception:
+        pass
+
+
 def _trace_bind(sid: str, action: str, transport, reason: str) -> None:
     try:
         line = (f"{time.time_ns() // 1000} sid={str(sid)[:8]} {action} "
-                f"transport={id(transport):x} reason={reason}\n")
-        with _frame_trace_lock:
-            with open(_FRAME_TRACE_PATH, "a") as fh:
-                fh.write(line)
+                f"transport={id(transport):x} cid={_conn_cid(transport)} reason={reason}\n")
+        _frame_trace_line(line)
+    except Exception:
+        pass
+
+
+def _trace_conn(action: str, cid: str, peer: str = "-", reason: str = "-") -> None:
+    """Brackets one WS connection's lifetime (connect/close) with its gateway-minted cid."""
+    try:
+        _frame_trace_line(f"{time.time_ns() // 1000} cid={cid} {action} peer={peer} reason={reason}\n")
+    except Exception:
+        pass
+
+
+def _trace_write_result(sid: str, obj: dict, transport, ok: bool) -> None:
+    """Write outcome of one routed frame, attributed to the frame by sid+seq. Reads the
+    transport's last-write record best-effort: concurrent writes on the same socket may
+    overwrite it between the write and this read — a diagnostic, not a lock. For coalesced
+    token batches the completion lands later, in that batch's ws_batch line instead."""
+    if not _write_trace_enabled():
+        return
+    try:
+        seq, etype, _rid = _frame_trace_ids(obj)
+        info = getattr(transport, "last_write_result", None) or {}
+        outcome = str(info.get("outcome") or ("written" if ok else "failed"))
+        line = (f"{time.time_ns() // 1000} sid={str(sid)[:8]} seq={seq} type={etype} "
+                f"cid={_conn_cid(transport)} write_done ok={1 if ok else 0} outcome={outcome} "
+                f"bytes={info.get('bytes', '-')} qdepth={info.get('qdepth', '-')} error={info.get('error') or '-'}\n")
+        _frame_trace_line(line)
+    except Exception:
+        pass
+
+
+def _trace_ws_batch(cid: str, frames: int, nbytes, outcome: str, error: str | None = None) -> None:
+    """Socket-write completion for one coalesced batch, stamped with the connection's cid.
+    Token coalescing means a batch cannot be attributed to individual sid/seq pairs — this is
+    the strongest joinable signal observable at write-completion time for buffered tokens."""
+    if not _write_trace_enabled():
+        return
+    try:
+        _frame_trace_line(f"{time.time_ns() // 1000} cid={cid} ws_batch frames={frames} "
+                          f"bytes={nbytes} outcome={outcome} error={error or '-'}\n")
     except Exception:
         pass
 
@@ -729,8 +796,10 @@ def write_json(obj: dict) -> bool:
         project_room_member_activity(obj, _sessions)
         sid = ((params or {}).get("session_id") or "") if isinstance(params, dict) else ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            _trace_frame(sid, obj, "session_transport")
-            return t.write(obj)
+            _trace_frame(sid, obj, "session_transport", transport=t)  # enqueue-time record (route line)
+            ok = t.write(obj)
+            _trace_write_result(sid, obj, t, ok)  # completion-time record (opt-in, Phase 1)
+            return ok
         # Phase 0 trace: no owning transport, so the frame falls through to the request's
         # transport / stdio — for a dashboard WS client that means the phone never sees it.
         # This line is what decides whether the frozen card is a server-side drop.

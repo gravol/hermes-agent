@@ -854,6 +854,35 @@ def _rebind_live_transport(sid: str, session: dict, transport: Transport) -> Non
         _cancel_ws_orphan_reap(sid)  # the client is back — a pending ws-orphan reap must not fire
 
 
+def trace_stream_ownership(sid: str) -> dict:
+    """Ownership assertion for ``sid`` right now: which cid owns the attached stream and which
+    cids are registered viewers (``session["viewers"]``). Diagnostic only — reads under the
+    sessions lock, mutates nothing, and emits one ``ownership`` frame-trace line so a frozen-card
+    log can answer "who owned this sid at time T" without joining CPython object ids. Returns the
+    same fields the line carries, for tests and ad-hoc RPC debugging."""
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        owner = None if session is None else session.get("transport")
+        viewers = list((session or {}).get("viewers") or {})
+    from tui_gateway.server import _conn_cid, _frame_trace_line  # Phase 0/1 trace (log-only)
+    info = {
+        "sid": sid,
+        "live": session is not None,
+        "owner_transport": format(id(owner), "x") if owner is not None else "-",
+        "owner_cid": _conn_cid(owner) if owner is not None else "-",
+        "viewers": len(viewers),
+        "viewer_cids": sorted({_conn_cid(v) for v in viewers}),
+    }
+    try:
+        _frame_trace_line(
+            f"{time.time_ns() // 1000} sid={str(sid)[:8]} ownership "
+            f"owner_transport={info['owner_transport']} owner_cid={info['owner_cid']} "
+            f"viewers={info['viewers']} viewer_cids={','.join(info['viewer_cids']) or '-'}\n")
+    except Exception:
+        pass
+    return info
+
+
 def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:
     """Whether a detached RUNNING turn's activity clock (``_touch_activity``) is still fresh — the reaper must NOT
     interrupt healthy detached work (closed laptop). Conservative: disabled threshold, missing/opaque agent, unreadable

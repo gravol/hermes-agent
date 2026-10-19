@@ -10,6 +10,7 @@ import contextlib
 import concurrent.futures
 import json
 import logging
+import secrets
 import socket
 import threading
 import time
@@ -95,10 +96,18 @@ class WSTransport:
     deadlock, so it detects that and fires-and-forgets. Loop-thread callers needing completion use ``write_async``."""
 
     def __init__(self, ws: Any, loop: asyncio.AbstractEventLoop, *, peer: str = "unknown",
-                 auth_identity: dict | None = None) -> None:
+                 auth_identity: dict | None = None, cid: str | None = None) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        #: Gateway-minted short connection id (see ``handle_ws``), echoed to the client in the
+        #: gateway.ready payload and stamped on every frame-trace line naming this transport.
+        self.cid = cid or "-"
+        #: Last write attempt's outcome for diagnostics: {"outcome": queued|scheduled|written|
+        #: in_flight|failed|timeout|closed, "bytes": int, "qdepth": int, "error": str|None}.
+        #: Best-effort single-slot record (concurrent writes overwrite); read by server-side
+        #: frame tracing only.
+        self.last_write_result: dict | None = None
         #: Server-verified identity from the WS-upgrade credential, stamped by ``web_server_chat._ws_auth_reason``; None
         #: for legacy-token/stdio. RPC params can never populate it: sole identity authority for browser controllers
         #: and for the ``user_id`` the agent is built with (``server._session_auth_user_id``).
@@ -124,6 +133,7 @@ class WSTransport:
         if self._closed:
             return False
         line = serialize_frame(obj, self._peer, _log)
+        nbytes = len(line.encode("utf-8", "replace"))
         on_loop = self._on_loop()
         # Streamed token: buffer it and arm the flush timer; the worker returns immediately.
         # call_soon_threadsafe is safe from a worker or the loop.
@@ -131,9 +141,12 @@ class WSTransport:
         if isinstance(params, dict) and params.get("type") in _STREAMING_EVENT_TYPES:
             with self._token_lock:
                 self._pending_tokens.append(line)
+                qdepth = len(self._pending_tokens)
                 if not self._token_flush_armed:
                     self._token_flush_armed = True
                     self._loop.call_soon_threadsafe(self._arm_token_flush)
+            # Enqueue-time record only: socket completion arrives later, as that batch's ws_batch trace line.
+            self.last_write_result = {"outcome": "queued", "bytes": nbytes, "qdepth": qdepth, "error": None}
             return not self._closed
         # Non-streaming frame: append behind any buffered tokens and flush the whole batch NOW so it
         # can never overtake them. The send is scheduled INSIDE the lock so wire order matches buffer
@@ -144,22 +157,33 @@ class WSTransport:
             batch, self._pending_tokens = self._pending_tokens, []
             if on_loop:
                 self._loop.create_task(self._safe_send_many(batch))
+                # Scheduled, not yet confirmed on the wire; completion lands in the ws_batch trace line.
+                self.last_write_result = {"outcome": "scheduled", "bytes": nbytes, "qdepth": 0, "error": None}
                 return True
             fut = safe_schedule_threadsafe(self._safe_send_many(batch), self._loop)
             if fut is None:
                 self._closed = True
+                self.last_write_result = {"outcome": "failed", "bytes": nbytes, "qdepth": 0, "error": "LoopClosed"}
                 return False
         try:
-            fut.result(timeout=_WS_WRITE_TIMEOUT_S)
+            outcome = fut.result(timeout=_WS_WRITE_TIMEOUT_S)
+            self.last_write_result = {
+                "outcome": outcome if outcome != "closed" else "failed",
+                "bytes": nbytes, "qdepth": 0,
+                "error": outcome.split(":", 1)[1] if outcome.startswith("failed:") else None,
+            }
             return not self._closed
         except concurrent.futures.TimeoutError:  # builtin TimeoutError on 3.11+
             # The loop is stalled (GIL-heavy turn, delegation), NOT the socket dead: the send is already
             # scheduled and flushes once the loop breathes. Latching _closed here permanently silenced
             # live windows after one slow write; _safe_send_many latches on a real error.
+            # Strongest signal observable right now: enqueue completed, socket result unknown (in flight).
+            self.last_write_result = {"outcome": "in_flight", "bytes": nbytes, "qdepth": 0, "error": None}
             _log.warning("ws write slow (loop stalled >%ss) peer=%s — frame left in flight", _WS_WRITE_TIMEOUT_S, self._peer)
             return not self._closed
         except Exception as exc:
             self._closed = True
+            self.last_write_result = {"outcome": "failed", "bytes": nbytes, "qdepth": 0, "error": type(exc).__name__}
             _log.warning("ws write failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
             return False
 
@@ -192,27 +216,36 @@ class WSTransport:
         await self._safe_send_many(batch)
         return not self._closed
 
-    async def _safe_send_many(self, lines: list[str]) -> None:
-        """Send one indivisible batch of pre-serialized frames in wire order."""
+    async def _safe_send_many(self, lines: list[str]) -> str:
+        """Send one indivisible batch of pre-serialized frames in wire order. Returns the batch
+        outcome (``written`` | ``timeout`` | ``failed:<ExcClass>`` | ``closed``) for the caller's
+        last-write record, and emits a ws_batch frame-trace line at completion. For coalesced token
+        batches this is the only joinable write-completion signal available — a batch has no single
+        sid/seq, so attribution stops at the connection (cid)."""
+        sent_bytes = 0
+        outcome, error = "written", None
         async with self._send_lock:
             if self._closed:
-                return
+                return "closed"
             for line in lines:
                 if self._closed:
-                    return
+                    outcome, error = "closed", None
+                    break
                 payload = _sanitize_ws_text(line)
                 try:
                     await asyncio.wait_for(self._ws.send_text(payload), timeout=_WS_SEND_DEADLINE_S)
+                    sent_bytes += len(payload.encode("utf-8", "replace"))
                 except TimeoutError:
                     # The loop is responsive (the timer fired) but the socket never drained: unlike the
                     # loop-stall wait in write(), this is a dead peer. Latch under the writer lock so queued
                     # batches bail, and close the socket so handle_ws's read loop ends and its teardown
                     # (session detach/reap, client reconnect) runs. See #106369.
                     self._closed = True
+                    outcome, error = "timeout", "TimeoutError"
                     _log.warning("ws send deadline exceeded (socket stalled, loop responsive) peer=%s deadline=%ss — closing",
                                  self._peer, _WS_SEND_DEADLINE_S)
                     self._loop.create_task(self._close_socket(1011, "send deadline"))
-                    return
+                    break
                 except UnicodeEncodeError as exc:
                     # A single illegal UTF-8 frame (lone surrogate) must not tear down the socket.
                     _log.warning("ws send skipped invalid utf-8 frame peer=%s error=%s", self._peer, exc)
@@ -220,8 +253,12 @@ class WSTransport:
                 except Exception as exc:
                     # Latch while holding the writer lock so queued batches observe the failure first.
                     self._closed = True
+                    outcome, error = f"failed:{type(exc).__name__}", type(exc).__name__
                     _log.warning("ws send failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
-                    return
+                    break
+        self.last_write_result = {"outcome": outcome, "bytes": sent_bytes, "qdepth": 0, "error": error}
+        server._trace_ws_batch(self.cid, len(lines), sent_bytes, outcome, error)
+        return outcome
 
     def close(self) -> None:  # loop thread (handle_ws finally), so the TimerHandle is safe
         self._closed = True
@@ -355,8 +392,13 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         # Mark the client attached before the (possibly slow) ready/skin setup so scale-to-zero sees it.
         _note_dashboard_client_activity(force=True)
         _disable_nagle(ws)
-        _log.info("ws accepted peer=%s", peer)
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity)
+        # Gateway-minted connection id: short, stable for this socket's lifetime, echoed to the
+        # client in gateway.ready and stamped on every frame-trace line naming this transport, so
+        # client-side logs and the gateway frame trace join on one token (not a CPython object id).
+        cid = secrets.token_hex(5)
+        _log.info("ws accepted peer=%s cid=%s", peer, cid)
+        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity, cid=cid)
+        server._trace_conn("connect", cid, peer)
         # resolve_skin() is sync I/O + CPU; pooled so the read loop can drain the frontend's initial RPC burst.
         skin_payload = await asyncio.to_thread(server.resolve_skin)
         # change_events: this backend broadcasts pet/cron/sessions.changed, so clients can demote legacy
@@ -366,6 +408,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             "jsonrpc": "2.0", "method": "event",
             "params": {"type": "gateway.ready", "payload": {
                 "skin": skin_payload, "change_events": True, "heartbeat": True, "replay_epoch": replay_epoch(),
+                "connection_id": cid,
             }},
         })
         if ready_ok:
@@ -466,6 +509,9 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 )
             except Exception:
                 _log.exception("ws transport teardown failed peer=%s", peer)
+            # Close half of the connect/close pair: same cid the client was handed at ready, so a
+            # log can bracket every frame a connection owned and join both ends on one token.
+            server._trace_conn("close", transport.cid, peer, reason=disconnect_reason)
         try:
             await ws.close()
         except Exception as exc:
