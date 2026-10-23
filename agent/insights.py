@@ -145,7 +145,7 @@ class InsightsEngine:
         " u.api_call_count, u.input_tokens, u.output_tokens,"
         " u.cache_read_tokens, u.cache_write_tokens, u.reasoning_tokens,"
         " u.estimated_cost_usd, u.actual_cost_usd, u.cost_status,"
-        " u.cost_source, u.billing_mode"
+        " u.cost_source, u.billing_mode, u.task"
         " FROM session_model_usage u"
         " JOIN sessions s ON s.id = u.session_id"
         " WHERE s.started_at >= ?",
@@ -204,6 +204,72 @@ class InsightsEngine:
         cutoff = time.time() - (days * 86400)
         return {"tools": self._compute_tool_breakdown(self._get_tool_usage(cutoff, source)),
                 "skills": self._compute_skill_breakdown(self._get_skill_usage(cutoff, source))}
+
+    def get_usage_summary(self, days: int = 30, source: str | None = None, *, model_limit: int = 20) -> dict[str, Any]:
+        """Token/cost rollup for ONE window, for clients that display a period rather than a report
+        (Hermex Insights' DAY/WEEK/MONTH selector, ``insights.get``).
+
+        Deliberately sourced from ``session_model_usage`` — the per-(model, task) rows — and NOT
+        from the ``sessions`` counters, because those hold main-agent-loop calls only: auxiliary
+        work (background memory review, context compaction, title generation, vision) never touches
+        them. Measured on a real store, that omission hid ~13% of input tokens and ~8% of API
+        calls, while the same spend was visible in the per-model table. ``generate()``/overview
+        already folds both in; this is the same accounting without the message/tool/skill scans, so
+        a phone polling a 1-day window doesn't pay for a full report.
+
+        One source for every number here also means the totals cannot disagree with the breakdowns:
+        an earlier dashboard path summed sessions for ``totals`` while showing task rows beside them,
+        which made its own overhead look like extra, uncounted spend.
+        """
+        cutoff = time.time() - (days * 86400)
+        flush = getattr(self.db, "flush_token_counts", None)
+        if callable(flush):
+            flush()
+        rows = self._get_model_usage(cutoff, source)
+        counters = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                    "reasoning_tokens", "api_call_count")
+        totals: dict[str, Any] = {key: sum(int(r.get(key) or 0) for r in rows) for key in counters}
+        totals["estimated_cost"] = round(sum(float(r.get("estimated_cost_usd") or 0.0) for r in rows), 6)
+        totals["actual_cost"] = round(sum(float(r.get("actual_cost_usd") or 0.0) for r in rows), 6)
+        totals["sessions"] = len({r["session_id"] for r in rows})
+
+        by_model: dict[str, dict[str, Any]] = {}
+        by_task: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            task = str(r.get("task") or "")
+            bucket = by_model.setdefault(str(r.get("model") or "unknown"),
+                                        {"model": str(r.get("model") or "unknown"), "api_calls": 0,
+                                         "estimated_cost": 0.0, "tasks": set()})
+            if task:
+                task_bucket = by_task.setdefault(task, {"task": task, "api_calls": 0, "models": [],
+                                                        "estimated_cost": 0.0, **{k: 0 for k in counters}})
+                if bucket["model"] not in task_bucket["models"]:
+                    task_bucket["models"].append(bucket["model"])
+                task_bucket["estimated_cost"] += float(r.get("estimated_cost_usd") or 0.0)
+                for key in counters:
+                    task_bucket[key] += int(r.get(key) or 0)
+            bucket["api_calls"] += int(r.get("api_call_count") or 0)
+            bucket["estimated_cost"] += float(r.get("estimated_cost_usd") or 0.0)
+            bucket["tasks"].add(task)
+            for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"):
+                bucket[key] = bucket.get(key, 0) + int(r.get(key) or 0)
+            bucket["total_tokens"] = (bucket.get("total_tokens", 0) + sum(int(r.get(k) or 0) for k in _TOKEN_KEYS))
+
+        def _by_volume(d: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+            return sorted(d.values(), key=lambda v: v.get("total_tokens", v.get("api_calls", 0)), reverse=True)
+
+        models = _by_volume(by_model)[:max(1, model_limit)]
+        for m in models:
+            m["tasks"] = sorted(t for t in m["tasks"] if t)
+            m["estimated_cost"] = round(m["estimated_cost"], 6)
+        tasks = _by_volume(by_task)
+        for t in tasks:
+            t["estimated_cost"] = round(t["estimated_cost"], 6)
+        return {
+            "period_days": days, "generated_at": time.time(), "source_filter": source,
+            "totals": totals, "models": models, "tasks": tasks,
+        }
+
 
     # ------------------------------------------------------------------ SQL
 
